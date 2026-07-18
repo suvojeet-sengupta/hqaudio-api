@@ -732,11 +732,19 @@
                 <div class="banned-ip-item" id="ban-${escapeHtml(ip)}">
                     <div class="ip-addr">${escapeHtml(ip)}</div>
                     <div>
-                        <button onclick="filterByIp('${escapeHtml(ip)}')">View Behavior</button>
-                        <button onclick="unbanIp('${escapeHtml(ip)}')">Unban</button>
+                        <button class="view-behavior-btn" data-ip="${escapeHtml(ip)}">View Behavior</button>
+                        <button class="unban-ip-btn" data-ip="${escapeHtml(ip)}">Unban</button>
                     </div>
                 </div>
             `).join('');
+
+            // Attach event listeners safely
+            list.querySelectorAll('.view-behavior-btn').forEach(btn => {
+                btn.onclick = () => filterByIp(btn.getAttribute('data-ip'));
+            });
+            list.querySelectorAll('.unban-ip-btn').forEach(btn => {
+                btn.onclick = () => unbanIp(btn.getAttribute('data-ip'));
+            });
         }
         function filterByIp(ip) {
             closeBannedModal();
