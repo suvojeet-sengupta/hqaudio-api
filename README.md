@@ -5,15 +5,15 @@
 
 An Unofficial API for downloading high-quality songs, albums, playlists, and more from [HqAudio](https://hqaudio.com). Fully migrated to Rust for superior performance and memory safety.
 
-## 📚 Documentation
+## Documentation
 
 Check out the [API documentation](https://hqaudio.suvojeetsengupta.in/docs) for detailed information on how to use the API.
 
-## 📰 Changelog
+## Changelog
 
 For a detailed list of changes, see the [CHANGELOG](CHANGELOG.md).
 
-## 🔌 Running Locally
+## Running Locally
 
 ### Using Docker (Recommended)
 
@@ -60,6 +60,11 @@ For a detailed list of changes, see the [CHANGELOG](CHANGELOG.md).
 
 The server will start on `http://0.0.0.0:3000` (or the port defined in your `.env` file).
 
-## 📜 License
+## Credits
+
+- **Sumit Kohle**: Original author.
+- **Suvojeet Sengupta**: Migrated the entire backend to Rust, implemented advanced caching and rate limiting, added robust security and DDoS protection, and built the real-time WebSocket logs and monitoring dashboard.
+
+## License
 
 This project is distributed under the [MIT License](https://opensource.org/licenses/MIT). For more information, see the [LICENSE](LICENSE) file included in this repository.
