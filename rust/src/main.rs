@@ -70,6 +70,7 @@ use utoipa_swagger_ui::SwaggerUi;
             models::ApiResponseSongCategory,
             models::ApiResponseArtistCategory,
             models::ApiResponsePlaylistCategory,
+            models::ApiResponsePlaylistDetail,
             models::ApiResponseAlbumCategory,
             models::ApiResponseArtistDetail,
             models::ApiResponseSearchResponse,

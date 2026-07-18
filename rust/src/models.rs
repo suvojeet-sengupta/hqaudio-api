@@ -145,10 +145,17 @@ pub struct PlaylistSearchItem {
 pub struct Playlist {
     pub id: String,
     pub name: String,
+    pub description: Option<String>,
+    pub year: Option<i32>,
+    pub r#type: Option<String>,
+    pub play_count: Option<i32>,
+    pub language: Option<String>,
+    pub explicit_content: Option<bool>,
+    pub song_count: Option<i32>,
     pub url: String,
     pub image: Vec<DownloadLink>,
+    pub songs: Option<Vec<Song>>,
 }
-
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +175,7 @@ pub struct SearchResponse {
     ApiResponsePlaylistCategory = ApiResponse<SearchResultCategory<Playlist>>,
     ApiResponseAlbumCategory = ApiResponse<SearchResultCategory<Album>>,
     ApiResponseArtistDetail = ApiResponse<crate::handlers::ArtistDetail>,
+    ApiResponsePlaylistDetail = ApiResponse<Playlist>,
     ApiResponseSearchResponse = ApiResponse<SearchResponse>,
     ApiResponseLyrics = ApiResponse<Lyrics>,
     ApiResponseStringList = ApiResponse<Vec<String>>,

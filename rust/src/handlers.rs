@@ -172,6 +172,14 @@ fn parse_playlist(v: &Value) -> Playlist {
             str_val(&v["url"])
         },
         image: create_image_links(&str_val(&v["image"])),
+        description: None,
+        year: None,
+        r#type: None,
+        play_count: None,
+        language: None,
+        explicit_content: None,
+        song_count: None,
+        songs: None,
     }
 }
 
@@ -546,24 +554,51 @@ pub async fn get_album_details(
     path = "/api/playlists",
     params(IdQuery),
     responses(
-        (status = 200, description = "Get playlist details", body = ApiResponseSongCategory)
+        (status = 200, description = "Get playlist details", body = ApiResponsePlaylistDetail)
     )
 )]
 pub async fn get_playlist_details(
     Query(query): Query<IdQuery>,
-) -> Result<Json<ApiResponse<SearchResultCategory<Song>>>, AppError> {
+) -> Result<Json<ApiResponse<Playlist>>, AppError> {
     let mut params = HashMap::new();
     params.insert("listid".to_string(), query.id);
 
     let raw = use_fetch("playlist.getDetails", params, None).await?;
-    let results = raw["list"]
+    let songs = raw["list"]
         .as_array()
-        .map(|arr| arr.iter().map(parse_song).collect())
+        .map(|arr| arr.iter().map(parse_song).collect::<Vec<Song>>())
         .unwrap_or_default();
+        
+    let song_count = songs.len() as i32;
+
+    let playlist = Playlist {
+        id: str_val(&raw["id"]),
+        name: if !str_val(&raw["title"]).is_empty() {
+            str_val(&raw["title"])
+        } else if !str_val(&raw["listname"]).is_empty() {
+            str_val(&raw["listname"])
+        } else {
+            str_val(&raw["name"])
+        },
+        description: raw["header_desc"].as_str().map(|s| s.to_string()),
+        year: str_val(&raw["year"]).parse().ok(),
+        r#type: raw["type"].as_str().map(|s| s.to_string()),
+        play_count: str_val(&raw["play_count"]).parse().ok(),
+        language: raw["language"].as_str().map(|s| s.to_string()),
+        explicit_content: Some(raw["explicit_content"].as_str() == Some("1")),
+        song_count: Some(song_count),
+        url: if !str_val(&raw["perma_url"]).is_empty() {
+            str_val(&raw["perma_url"])
+        } else {
+            str_val(&raw["url"])
+        },
+        image: create_image_links(&str_val(&raw["image"])),
+        songs: Some(songs),
+    };
 
     Ok(Json(ApiResponse {
         success: true,
-        data: SearchResultCategory { results, position: 1 },
+        data: playlist,
     }))
 }
 
