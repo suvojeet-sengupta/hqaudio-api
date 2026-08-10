@@ -975,7 +975,12 @@ pub async fn get_banned_ips(
 ) -> Result<Json<ApiResponse<Vec<String>>>, AppError> {
     verify_logs_password(&payload.password)?;
     
-    let mut banned_ips = Vec::new();
+    let mut banned_ips_set = std::collections::HashSet::new();
+
+    for ip in crate::MEMORY_BAN_MANAGER.get_banned_ips() {
+        banned_ips_set.insert(ip);
+    }
+
     if let Some(pool) = crate::api::REDIS_POOL.get() {
         if let Ok(mut conn) = pool.get().await {
             use redis::AsyncCommands;
@@ -984,13 +989,15 @@ pub async fn get_banned_ips(
             if let Ok(keys) = keys_cmd.query_async::<Vec<String>>(&mut *conn).await {
                 for key in keys {
                     if let Some(ip) = key.strip_prefix("ban:") {
-                        banned_ips.push(ip.to_string());
+                        banned_ips_set.insert(ip.to_string());
                     }
                 }
             }
         }
     }
     
+    let banned_ips: Vec<String> = banned_ips_set.into_iter().collect();
+
     Ok(Json(ApiResponse {
         success: true,
         data: banned_ips,
@@ -1002,6 +1009,8 @@ pub async fn unban_ip(
 ) -> Result<Json<ApiResponse<serde_json::Value>>, AppError> {
     verify_logs_password(&payload.password)?;
     
+    crate::MEMORY_BAN_MANAGER.unban_ip(&payload.ip);
+
     if let Some(pool) = crate::api::REDIS_POOL.get() {
         if let Ok(mut conn) = pool.get().await {
             use redis::AsyncCommands;
@@ -1010,13 +1019,14 @@ pub async fn unban_ip(
             
             let strike_key = format!("strikes:{}", payload.ip);
             let _: Result<(), _> = conn.del(&strike_key).await;
-            
-            let _ = crate::LOG_CHANNEL.send(format!("[SYSTEM] IP {} was manually unbanned by admin", payload.ip));
         }
     }
     
+    let _ = crate::LOG_CHANNEL.send(format!("[SYSTEM] IP {} was manually unbanned by admin", payload.ip));
+
     Ok(Json(ApiResponse {
         success: true,
         data: serde_json::Value::Null,
     }))
 }
+

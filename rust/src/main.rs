@@ -17,6 +17,8 @@ use std::net::SocketAddr;
 use std::time::Instant;
 use tokio::fs::{create_dir_all, OpenOptions};
 use tokio::io::AsyncWriteExt;
+use std::collections::HashMap;
+use std::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tower_http::compression::CompressionLayer;
 use tower_http::trace::TraceLayer;
@@ -25,6 +27,73 @@ use tower_governor::{governor::GovernorConfigBuilder, GovernorLayer};
 use tower_governor::key_extractor::SmartIpKeyExtractor;
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
+
+pub struct MemoryBanManager {
+    bans: RwLock<HashMap<String, Instant>>,
+    strikes: RwLock<HashMap<String, (u32, Instant)>>,
+}
+
+impl MemoryBanManager {
+    pub fn new() -> Self {
+        Self {
+            bans: RwLock::new(HashMap::new()),
+            strikes: RwLock::new(HashMap::new()),
+        }
+    }
+
+    pub fn is_banned(&self, ip: &str) -> bool {
+        let mut bans = self.bans.write().unwrap();
+        if let Some(&expire_at) = bans.get(ip) {
+            if Instant::now() < expire_at {
+                return true;
+            } else {
+                bans.remove(ip);
+            }
+        }
+        false
+    }
+
+    pub fn ban_ip(&self, ip: &str, duration_secs: u64) {
+        let expire_at = Instant::now() + std::time::Duration::from_secs(duration_secs);
+        let mut bans = self.bans.write().unwrap();
+        bans.insert(ip.to_string(), expire_at);
+
+        let mut strikes = self.strikes.write().unwrap();
+        strikes.remove(ip);
+    }
+
+    pub fn unban_ip(&self, ip: &str) {
+        let mut bans = self.bans.write().unwrap();
+        bans.remove(ip);
+
+        let mut strikes = self.strikes.write().unwrap();
+        strikes.remove(ip);
+    }
+
+    pub fn add_strike(&self, ip: &str, window_secs: u64) -> u32 {
+        let mut strikes = self.strikes.write().unwrap();
+        let now = Instant::now();
+        let window = std::time::Duration::from_secs(window_secs);
+
+        let entry = strikes.entry(ip.to_string()).or_insert((0, now));
+        if now.duration_since(entry.1) > window {
+            *entry = (1, now);
+            1
+        } else {
+            entry.0 += 1;
+            entry.0
+        }
+    }
+
+    pub fn get_banned_ips(&self) -> Vec<String> {
+        let mut bans = self.bans.write().unwrap();
+        let now = Instant::now();
+        bans.retain(|_, expire_at| *expire_at > now);
+        bans.keys().cloned().collect()
+    }
+}
+
+pub static MEMORY_BAN_MANAGER: Lazy<MemoryBanManager> = Lazy::new(MemoryBanManager::new);
 
 #[derive(OpenApi)]
 #[openapi(
@@ -353,16 +422,19 @@ async fn logging_middleware(req: Request, next: Next) -> Response {
         });
         
     // --- DDOS BLOCKLIST CHECK ---
-    if let Some(pool) = crate::api::REDIS_POOL.get() {
-        if let Ok(mut conn) = pool.get().await {
-            use redis::AsyncCommands;
-            let ban_key = format!("ban:{}", ip);
-            let is_banned: bool = conn.exists(&ban_key).await.unwrap_or(false);
-            if is_banned {
-                let _ = crate::LOG_CHANNEL.send(format!("[DDOS PROTECT] Blocked request from banned IP: {}", ip));
-                return (axum::http::StatusCode::FORBIDDEN, "IP blocked for 24 hours due to abuse").into_response();
+    let mut is_banned = MEMORY_BAN_MANAGER.is_banned(&ip);
+    if !is_banned {
+        if let Some(pool) = crate::api::REDIS_POOL.get() {
+            if let Ok(mut conn) = pool.get().await {
+                use redis::AsyncCommands;
+                let ban_key = format!("ban:{}", ip);
+                is_banned = conn.exists(&ban_key).await.unwrap_or(false);
             }
         }
+    }
+    if is_banned {
+        let _ = crate::LOG_CHANNEL.send(format!("[DDOS PROTECT] Blocked request from banned IP: {}", ip));
+        return (axum::http::StatusCode::FORBIDDEN, "IP blocked for 24 hours due to abuse").into_response();
     }
     // ----------------------------
     
@@ -371,21 +443,50 @@ async fn logging_middleware(req: Request, next: Next) -> Response {
     
     // --- DDOS STRIKE TRACKING ---
     if status == 429 { // Too Many Requests
+        let strike_threshold: u32 = std::env::var("BAN_STRIKE_THRESHOLD")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5);
+        let strike_window_secs: u64 = std::env::var("STRIKE_WINDOW_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(600); // 10 min window
+        let ban_duration_secs: u64 = std::env::var("BAN_DURATION_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(86400); // 24 hours ban
+
+        let mem_strikes = MEMORY_BAN_MANAGER.add_strike(&ip, strike_window_secs);
+        let mut redis_strikes: u32 = 0;
+
         if let Some(pool) = crate::api::REDIS_POOL.get() {
             if let Ok(mut conn) = pool.get().await {
                 use redis::AsyncCommands;
                 let strike_key = format!("strikes:{}", ip);
-                let strikes: i32 = conn.incr(&strike_key, 1).await.unwrap_or(0);
-                if strikes == 1 {
-                    let _: Result<(), _> = conn.expire(&strike_key, 60).await; // 1 min window
-                }
-                
-                if strikes >= 100 { // 100 rate limit hits in 1 minute
-                    let ban_key = format!("ban:{}", ip);
-                    let _: Result<(), _> = conn.set_ex(&ban_key, "1", 86400).await; // Ban for 24h
-                    let _ = crate::LOG_CHANNEL.send(format!("[DDOS PROTECT] 🚨 BANNED IP {} for 24 hours after {} strikes", ip, strikes));
+                let count: i64 = conn.incr(&strike_key, 1).await.unwrap_or(0);
+                redis_strikes = count as u32;
+                if count == 1 {
+                    let _: Result<(), _> = conn.expire(&strike_key, strike_window_secs as i64).await;
                 }
             }
+        }
+
+        let strikes = std::cmp::max(mem_strikes, redis_strikes);
+        if strikes >= strike_threshold {
+            MEMORY_BAN_MANAGER.ban_ip(&ip, ban_duration_secs);
+
+            if let Some(pool) = crate::api::REDIS_POOL.get() {
+                if let Ok(mut conn) = pool.get().await {
+                    use redis::AsyncCommands;
+                    let ban_key = format!("ban:{}", ip);
+                    let _: Result<(), _> = conn.set_ex(&ban_key, "1", ban_duration_secs).await;
+                }
+            }
+
+            let _ = crate::LOG_CHANNEL.send(format!(
+                "[DDOS PROTECT] 🚨 BANNED IP {} for 24 hours after {} strikes (429 Too Many Requests)",
+                ip, strikes
+            ));
         }
     }
     // ----------------------------
@@ -447,16 +548,28 @@ async fn system_status_task() {
                 }
 
                 // Fetch ban count
+                let mut banned_ips_set = std::collections::HashSet::new();
+                for ip in MEMORY_BAN_MANAGER.get_banned_ips() {
+                    banned_ips_set.insert(ip);
+                }
+
                 let mut keys_cmd = redis::cmd("KEYS");
                 keys_cmd.arg("ban:*");
                 if let Ok(Ok(keys)) = tokio::time::timeout(std::time::Duration::from_millis(500), keys_cmd.query_async::<Vec<String>>(&mut *conn)).await {
-                    banned_ips_count = keys.len();
+                    for key in keys {
+                        if let Some(ip) = key.strip_prefix("ban:") {
+                            banned_ips_set.insert(ip.to_string());
+                        }
+                    }
                 }
+                banned_ips_count = banned_ips_set.len();
             } else {
                 redis_status = "Pool Exhausted/Error".to_string();
+                banned_ips_count = MEMORY_BAN_MANAGER.get_banned_ips().len();
             }
         } else {
             redis_status = "Not Initialized".to_string();
+            banned_ips_count = MEMORY_BAN_MANAGER.get_banned_ips().len();
         }
         
         let db_status = "N/A (Redis Only)".to_string();
@@ -535,4 +648,29 @@ mod tests {
         let _ = tokio::fs::remove_file(&path_today).await;
         let _ = tokio::fs::remove_file(&path_yesterday).await;
     }
+
+    #[test]
+    fn test_memory_ban_manager() {
+        let manager = MemoryBanManager::new();
+        let ip = "192.168.1.100";
+
+        assert!(!manager.is_banned(ip));
+
+        for i in 1..=4 {
+            let strikes = manager.add_strike(ip, 600);
+            assert_eq!(strikes, i);
+        }
+        assert!(!manager.is_banned(ip));
+
+        let strikes = manager.add_strike(ip, 600);
+        assert_eq!(strikes, 5);
+
+        manager.ban_ip(ip, 86400);
+        assert!(manager.is_banned(ip));
+        assert!(manager.get_banned_ips().contains(&ip.to_string()));
+
+        manager.unban_ip(ip);
+        assert!(!manager.is_banned(ip));
+    }
 }
+
