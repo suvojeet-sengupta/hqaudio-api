@@ -841,7 +841,7 @@ pub async fn view_log_file(
 
     // 3. Read file tail safely (async & bounded memory)
     let path = format!("logs/{}", file_name);
-    match read_log_tail(&path, 10000, 10 * 1024 * 1024).await {
+    match read_log_tail(&path, 200_000, 50 * 1024 * 1024).await {
         Ok(content) => Ok(Json(ApiResponse {
             success: true,
             data: content,
@@ -921,11 +921,25 @@ async fn handle_ws(socket: WebSocket, file_name: String) {
 
     // 2. Load latest history tail (bounded async read to avoid memory overload)
     let path = format!("logs/{}", target_file);
-    if let Ok(content) = read_log_tail(&path, 10000, 10 * 1024 * 1024).await {
-        // Send initial dump of logs
-        let _ = sender.send(Message::Text(format!("[INITIAL_DUMP]\n{}", content))).await;
+    if let Ok(content) = read_log_tail(&path, 200_000, 50 * 1024 * 1024).await {
+        // Send initial dump in chunks to avoid a single multi-MB WebSocket frame
+        let lines: Vec<&str> = content.lines().collect();
+        let chunk_size = 5000;
+        let total_chunks = (lines.len() + chunk_size - 1) / chunk_size;
+
+        if lines.is_empty() {
+            let _ = sender.send(Message::Text("[INITIAL_DUMP]\n".to_string())).await;
+        } else {
+            for (i, chunk) in lines.chunks(chunk_size).enumerate() {
+                let chunk_content = chunk.join("\n");
+                let prefix = if i == 0 { "[INITIAL_DUMP]\n" } else { "[INITIAL_DUMP_CONT]\n" };
+                let _ = sender.send(Message::Text(format!("{}{}", prefix, chunk_content))).await;
+            }
+        }
+        let _ = sender.send(Message::Text("[INITIAL_DUMP_END]".to_string())).await;
     } else {
         let _ = sender.send(Message::Text("[INITIAL_DUMP]\n".to_string())).await;
+        let _ = sender.send(Message::Text("[INITIAL_DUMP_END]".to_string())).await;
     }
 
     // 3. If it's today's log file, stream live updates!

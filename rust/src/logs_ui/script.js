@@ -1,8 +1,8 @@
 // ═══════════════════════════════════════════
 // STATE MANAGEMENT & PERFORMANCE CONSTANTS
 // ═══════════════════════════════════════════
-const MAX_DOM_LINES = 2000;       // Max DOM nodes to keep UI at 60 FPS
-const MAX_STORED_LINES = 10000;   // Max in-memory lines retained in ring buffer
+const MAX_DOM_LINES = 3000;       // Max DOM nodes to keep UI at 60 FPS
+const MAX_STORED_LINES = 200000;  // Max in-memory lines retained in ring buffer
 const BATCH_FLUSH_INTERVAL = 50;  // Flush incoming logs to DOM every 50ms
 
 let logsPassword = localStorage.getItem('logs_password') || '';
@@ -15,6 +15,7 @@ let reconnectAttempts = 0;
 let filterTab = 'all';
 let debounceTimer = null;
 let statsDebounceTimer = null;
+let isLoadingInitialDump = false;  // True while receiving chunked initial dump
 
 // Streaming & Auto-scroll States
 let isStreamPaused = false;
@@ -300,13 +301,25 @@ function connectLogsWs() {
     ws.onmessage = (event) => {
         const message = event.data;
 
-        if (message.startsWith('[INITIAL_DUMP]\n')) {
-            // Initial dump from tail reader
+        if (message.startsWith('[INITIAL_DUMP]\n') || message === '[INITIAL_DUMP]\n' || message === '[INITIAL_DUMP]') {
+            // First chunk of initial dump from tail reader
+            isLoadingInitialDump = true;
             const content = message.slice(15);
             const lines = content.split('\n').filter(line => line.trim() !== '');
-            originalLogLines = lines.slice(-MAX_STORED_LINES);
+            originalLogLines = lines;
+        } else if (message.startsWith('[INITIAL_DUMP_CONT]\n')) {
+            // Continuation chunk of initial dump
+            const content = message.slice(20);
+            const lines = content.split('\n').filter(line => line.trim() !== '');
+            originalLogLines.push(...lines);
+        } else if (message === '[INITIAL_DUMP_END]') {
+            // All chunks received — apply filters and render
+            isLoadingInitialDump = false;
+            // Trim to max stored lines (keep the latest)
+            if (originalLogLines.length > MAX_STORED_LINES) {
+                originalLogLines = originalLogLines.slice(-MAX_STORED_LINES);
+            }
             applyAllFilters();
-
             if (originalLogLines.length === 0) {
                 showEmptyLogState();
             }
@@ -323,8 +336,10 @@ function connectLogsWs() {
                 console.error("Failed to parse system status", e);
             }
         } else {
-            // Live streamed log line
-            handleIncomingLogMessage(message);
+            // Live streamed log line (skip if still loading initial dump)
+            if (!isLoadingInitialDump) {
+                handleIncomingLogMessage(message);
+            }
         }
     };
 
