@@ -638,6 +638,16 @@ function linePassesFilters(line) {
         }
     }
 
+    // Hide cache-internal lines from the main console unless "Cache" tab is active.
+    // Stats/metrics are still 100% accurate because ingestLineStats() runs on ALL lines
+    // before this filter is ever called.
+    if (filterTab !== 'cache') {
+        const cachePatterns = ['[L1 CACHE HIT]', '[L2 CACHE HIT]', '[CACHE HIT]', '[CACHE MISS]', '[CACHE EXPIRED]', '[UPSTREAM FETCH SUCCESS]'];
+        for (let i = 0; i < cachePatterns.length; i++) {
+            if (line.includes(cachePatterns[i])) return false;
+        }
+    }
+
     // Tab Filter
     if (filterTab !== 'all') {
         const parsed = parseLogLine(line);
