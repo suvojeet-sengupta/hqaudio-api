@@ -1018,7 +1018,6 @@ pub async fn get_banned_ips(
 
     if let Some(pool) = crate::api::REDIS_POOL.get() {
         if let Ok(mut conn) = pool.get().await {
-            use redis::AsyncCommands;
             let mut keys_cmd = redis::cmd("KEYS");
             keys_cmd.arg("ban:*");
             if let Ok(keys) = keys_cmd.query_async::<Vec<String>>(&mut *conn).await {

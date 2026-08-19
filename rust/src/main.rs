@@ -559,11 +559,11 @@ async fn system_status_task() {
 
         let mut redis_status = "Disconnected".to_string();
         let mut cache_system_status = "Degraded".to_string();
-        let mut banned_ips_count = 0;
+        let banned_ips_count;
         
         if let Some(pool) = crate::api::REDIS_POOL.get() {
             if let Ok(Ok(mut conn)) = tokio::time::timeout(std::time::Duration::from_millis(500), pool.get()).await {
-                let mut cmd = redis::cmd("PING");
+                let cmd = redis::cmd("PING");
                 let ping_fut = cmd.query_async(&mut *conn);
                 if let Ok(Ok(pong)) = tokio::time::timeout(std::time::Duration::from_millis(500), ping_fut).await {
                     let pong: String = pong;

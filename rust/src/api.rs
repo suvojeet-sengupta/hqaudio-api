@@ -151,8 +151,6 @@ static CLIENT: Lazy<Client> = Lazy::new(|| {
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
         .tcp_keepalive(Some(Duration::from_secs(60)))
-        .http2_adaptive_window(true)
-        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
         .gzip(true)
         .brotli(true)
         .build()
