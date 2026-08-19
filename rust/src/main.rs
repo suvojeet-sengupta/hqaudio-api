@@ -42,12 +42,26 @@ impl MemoryBanManager {
     }
 
     pub fn is_banned(&self, ip: &str) -> bool {
-        let mut bans = self.bans.write().unwrap();
-        if let Some(&expire_at) = bans.get(ip) {
-            if Instant::now() < expire_at {
-                return true;
-            } else {
-                bans.remove(ip);
+        let now = Instant::now();
+        // Fast non-blocking read lock check for 99.999% of requests
+        {
+            if let Ok(bans) = self.bans.read() {
+                if let Some(&expire_at) = bans.get(ip) {
+                    if now < expire_at {
+                        return true;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        // Lazy cleanup for expired ban
+        if let Ok(mut bans) = self.bans.write() {
+            if let Some(&expire_at) = bans.get(ip) {
+                if now >= expire_at {
+                    bans.remove(ip);
+                }
             }
         }
         false
@@ -55,23 +69,28 @@ impl MemoryBanManager {
 
     pub fn ban_ip(&self, ip: &str, duration_secs: u64) {
         let expire_at = Instant::now() + std::time::Duration::from_secs(duration_secs);
-        let mut bans = self.bans.write().unwrap();
-        bans.insert(ip.to_string(), expire_at);
-
-        let mut strikes = self.strikes.write().unwrap();
-        strikes.remove(ip);
+        if let Ok(mut bans) = self.bans.write() {
+            bans.insert(ip.to_string(), expire_at);
+        }
+        if let Ok(mut strikes) = self.strikes.write() {
+            strikes.remove(ip);
+        }
     }
 
     pub fn unban_ip(&self, ip: &str) {
-        let mut bans = self.bans.write().unwrap();
-        bans.remove(ip);
-
-        let mut strikes = self.strikes.write().unwrap();
-        strikes.remove(ip);
+        if let Ok(mut bans) = self.bans.write() {
+            bans.remove(ip);
+        }
+        if let Ok(mut strikes) = self.strikes.write() {
+            strikes.remove(ip);
+        }
     }
 
     pub fn add_strike(&self, ip: &str, window_secs: u64) -> u32 {
-        let mut strikes = self.strikes.write().unwrap();
+        let mut strikes = match self.strikes.write() {
+            Ok(s) => s,
+            Err(p) => p.into_inner(),
+        };
         let now = Instant::now();
         let window = std::time::Duration::from_secs(window_secs);
 
@@ -86,10 +105,15 @@ impl MemoryBanManager {
     }
 
     pub fn get_banned_ips(&self) -> Vec<String> {
-        let mut bans = self.bans.write().unwrap();
         let now = Instant::now();
-        bans.retain(|_, expire_at| *expire_at > now);
-        bans.keys().cloned().collect()
+        if let Ok(bans) = self.bans.read() {
+            bans.iter()
+                .filter(|(_, &expire_at)| expire_at > now)
+                .map(|(ip, _)| ip.clone())
+                .collect()
+        } else {
+            Vec::new()
+        }
     }
 }
 
@@ -162,16 +186,25 @@ async fn main() {
     // 1. Initialize tracer logging
     tracing_subscriber::fmt::init();
 
-    // 1.5 Initialize Redis Pool
+    // 1.5 Initialize Redis Pool with High-Concurrency Sizing
     let redis_url = std::env::var("REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/0".to_string());
+    let redis_pool_size: u32 = std::env::var("REDIS_POOL_SIZE")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(64);
+    let redis_min_idle: u32 = std::env::var("REDIS_MIN_IDLE")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(10);
+
     if let Ok(manager) = RedisConnectionManager::new(redis_url) {
         if let Ok(pool) = bb8_redis::bb8::Pool::builder()
-                .max_size(20)
-                .min_idle(Some(5))
+                .max_size(redis_pool_size)
+                .min_idle(Some(redis_min_idle))
                 .connection_timeout(std::time::Duration::from_secs(3))
                 .build(manager).await {
             let _ = api::REDIS_POOL.set(pool);
-            println!("✅ Connected to Redis successfully");
+            println!("✅ Connected to Redis successfully (Pool size: {}, Min idle: {})", redis_pool_size, redis_min_idle);
         } else {
             eprintln!("⚠️ Failed to create Redis pool");
         }
@@ -186,11 +219,20 @@ async fn main() {
     // 2. Setup CORS
     let cors = CorsLayer::permissive();
 
-    // 2.5 Setup Rate Limiter (10 req/sec per IP, burst up to 50)
+    // 2.5 Setup High-Throughput Rate Limiter (Default 100 req/sec per IP, burst up to 300)
+    let rate_limit_per_sec: u64 = std::env::var("RATE_LIMIT_PER_SEC")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100);
+    let rate_limit_burst: u32 = std::env::var("RATE_LIMIT_BURST")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300);
+
     let governor_conf = std::sync::Arc::new(
         GovernorConfigBuilder::default()
-            .per_second(10)
-            .burst_size(50)
+            .per_second(rate_limit_per_sec)
+            .burst_size(rate_limit_burst)
             .key_extractor(SmartIpKeyExtractor)
             .finish()
             .unwrap(),
@@ -421,22 +463,13 @@ async fn logging_middleware(req: Request, next: Next) -> Response {
                 .unwrap_or_else(|| "unknown".to_string())
         });
         
-    // --- DDOS BLOCKLIST CHECK ---
-    let mut is_banned = MEMORY_BAN_MANAGER.is_banned(&ip);
-    if !is_banned {
-        if let Some(pool) = crate::api::REDIS_POOL.get() {
-            if let Ok(mut conn) = pool.get().await {
-                use redis::AsyncCommands;
-                let ban_key = format!("ban:{}", ip);
-                is_banned = conn.exists(&ban_key).await.unwrap_or(false);
-            }
-        }
-    }
+    // --- DDOS BLOCKLIST CHECK (100% In-Memory Fast Path) ---
+    let is_banned = MEMORY_BAN_MANAGER.is_banned(&ip);
     if is_banned {
         let _ = crate::LOG_CHANNEL.send(format!("[DDOS PROTECT] Blocked request from banned IP: {}", ip));
         return (axum::http::StatusCode::FORBIDDEN, "IP blocked for 24 hours due to abuse").into_response();
     }
-    // ----------------------------
+    // --------------------------------------------------------
     
     let response = next.run(req).await;
     let status = response.status().as_u16();
@@ -523,11 +556,6 @@ async fn system_status_task() {
     
     loop {
         interval.tick().await;
-        
-        // Ensure there are active subscribers before querying pool
-        if LOG_BROADCAST.receiver_count() == 0 {
-            continue;
-        }
 
         let mut redis_status = "Disconnected".to_string();
         let mut cache_system_status = "Degraded".to_string();
@@ -541,13 +569,13 @@ async fn system_status_task() {
                     let pong: String = pong;
                     if pong == "PONG" {
                         redis_status = "Connected".to_string();
-                        cache_system_status = "Operational".to_string();
+                        cache_system_status = "Operational (L1+L2)".to_string();
                     }
                 } else {
                     redis_status = "Error".to_string();
                 }
 
-                // Fetch ban count
+                // Sync Redis bans into local MemoryBanManager & fetch total ban count
                 let mut banned_ips_set = std::collections::HashSet::new();
                 for ip in MEMORY_BAN_MANAGER.get_banned_ips() {
                     banned_ips_set.insert(ip);
@@ -558,6 +586,7 @@ async fn system_status_task() {
                 if let Ok(Ok(keys)) = tokio::time::timeout(std::time::Duration::from_millis(500), keys_cmd.query_async::<Vec<String>>(&mut *conn)).await {
                     for key in keys {
                         if let Some(ip) = key.strip_prefix("ban:") {
+                            MEMORY_BAN_MANAGER.ban_ip(ip, 86400);
                             banned_ips_set.insert(ip.to_string());
                         }
                     }
@@ -568,21 +597,25 @@ async fn system_status_task() {
                 banned_ips_count = MEMORY_BAN_MANAGER.get_banned_ips().len();
             }
         } else {
-            redis_status = "Not Initialized".to_string();
+            redis_status = "Not Initialized (L1 Only)".to_string();
+            cache_system_status = "Operational (L1 Memory)".to_string();
             banned_ips_count = MEMORY_BAN_MANAGER.get_banned_ips().len();
         }
         
         let db_status = "N/A (Redis Only)".to_string();
         
-        let status_json = serde_json::json!({
-            "cache_system": cache_system_status,
-            "redis": redis_status,
-            "db": db_status,
-            "banned_ips": banned_ips_count,
-            "ddos_protection": if redis_status == "Connected" { "Active" } else { "Degraded" }
-        }).to_string();
-        
-        let _ = LOG_BROADCAST.send(format!("[SYS_STATUS] {}", status_json));
+        // Ensure there are active subscribers before broadcasting
+        if LOG_BROADCAST.receiver_count() > 0 {
+            let status_json = serde_json::json!({
+                "cache_system": cache_system_status,
+                "redis": redis_status,
+                "db": db_status,
+                "banned_ips": banned_ips_count,
+                "ddos_protection": if redis_status == "Connected" { "Active" } else { "Memory Only" }
+            }).to_string();
+            
+            let _ = LOG_BROADCAST.send(format!("[SYS_STATUS] {}", status_json));
+        }
     }
 }
 

@@ -12,6 +12,9 @@ services:
       - PORT=3000
       - RUST_LOG=info
       - REDIS_URL=redis://hqaudio-redis:6379/0
+      - REDIS_POOL_SIZE=64
+      - RATE_LIMIT_PER_SEC=100
+      - RATE_LIMIT_BURST=300
       - TZ=Asia/Kolkata
     env_file:
       - .env

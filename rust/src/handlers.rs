@@ -787,6 +787,41 @@ pub async fn get_log_files(
     }))
 }
 
+async fn read_log_tail(path: &str, max_lines: usize, max_bytes: u64) -> Result<String, std::io::Error> {
+    use tokio::fs::File;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+    
+    let mut file = File::open(path).await?;
+    let metadata = file.metadata().await?;
+    let file_len = metadata.len();
+    
+    if file_len <= max_bytes {
+        let mut content = String::new();
+        file.read_to_string(&mut content).await?;
+        let lines: Vec<&str> = content.lines().collect();
+        if lines.len() > max_lines {
+            return Ok(lines[lines.len() - max_lines..].join("\n"));
+        }
+        return Ok(content);
+    }
+    
+    let seek_pos = file_len.saturating_sub(max_bytes);
+    file.seek(SeekFrom::Start(seek_pos)).await?;
+    
+    let mut buffer = Vec::with_capacity(max_bytes as usize);
+    file.read_to_end(&mut buffer).await?;
+    
+    let text = String::from_utf8_lossy(&buffer);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if seek_pos > 0 && !lines.is_empty() {
+        lines.remove(0); // Discard potential partial line
+    }
+    if lines.len() > max_lines {
+        lines = lines[lines.len() - max_lines..].to_vec();
+    }
+    Ok(lines.join("\n"))
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct ViewLogPayload {
     pub password: String,
@@ -804,9 +839,9 @@ pub async fn view_log_file(
         return Err(AppError::BadRequest("Invalid log file name".to_string()));
     }
 
-    // 3. Read file (async to avoid blocking the Tokio runtime)
+    // 3. Read file tail safely (async & bounded memory)
     let path = format!("logs/{}", file_name);
-    match tokio::fs::read_to_string(&path).await {
+    match read_log_tail(&path, 5000, 4 * 1024 * 1024).await {
         Ok(content) => Ok(Json(ApiResponse {
             success: true,
             data: content,
@@ -884,9 +919,9 @@ async fn handle_ws(socket: WebSocket, file_name: String) {
         file_name.clone()
     };
 
-    // 2. Load existing history (async read to avoid blocking)
+    // 2. Load latest history tail (bounded async read to avoid memory overload)
     let path = format!("logs/{}", target_file);
-    if let Ok(content) = tokio::fs::read_to_string(&path).await {
+    if let Ok(content) = read_log_tail(&path, 2500, 2 * 1024 * 1024).await {
         // Send initial dump of logs
         let _ = sender.send(Message::Text(format!("[INITIAL_DUMP]\n{}", content))).await;
     } else {

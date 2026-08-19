@@ -5,13 +5,96 @@ use serde_json::Value;
 use bb8_redis::{bb8, RedisConnectionManager};
 use redis::AsyncCommands;
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use tokio::sync::{Mutex, OnceCell};
 
 pub type RedisPool = bb8::Pool<RedisConnectionManager>;
 pub static REDIS_POOL: tokio::sync::OnceCell<RedisPool> = tokio::sync::OnceCell::const_new();
 
+// ══════════════════════════════════════════════════════════════════
+// HIGH-SPEED L1 IN-MEMORY CACHE (Sharded Concurrent LRU/TTL)
+// ══════════════════════════════════════════════════════════════════
+#[derive(Clone)]
+struct CacheEntry {
+    value: Value,
+    expires_at: Instant,
+}
+
+const NUM_L1_SHARDS: usize = 32;
+const MAX_ENTRIES_PER_SHARD: usize = 2048; // Total L1 capacity: ~65,536 items
+
+pub struct ShardedL1Cache {
+    shards: Vec<RwLock<HashMap<String, CacheEntry>>>,
+}
+
+impl ShardedL1Cache {
+    fn new() -> Self {
+        let mut shards = Vec::with_capacity(NUM_L1_SHARDS);
+        for _ in 0..NUM_L1_SHARDS {
+            shards.push(RwLock::new(HashMap::with_capacity(MAX_ENTRIES_PER_SHARD)));
+        }
+        Self { shards }
+    }
+
+    fn get_shard_index(&self, key: &str) -> usize {
+        let mut hash: usize = 5381;
+        for b in key.bytes() {
+            hash = ((hash << 5).wrapping_add(hash)).wrapping_add(b as usize);
+        }
+        hash % NUM_L1_SHARDS
+    }
+
+    pub fn get(&self, key: &str) -> Option<Value> {
+        let idx = self.get_shard_index(key);
+        let now = Instant::now();
+        if let Ok(shard) = self.shards[idx].read() {
+            if let Some(entry) = shard.get(key) {
+                if now < entry.expires_at {
+                    return Some(entry.value.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn set(&self, key: &str, value: Value, ttl: Duration) {
+        if ttl == Duration::ZERO {
+            return;
+        }
+        let idx = self.get_shard_index(key);
+        let now = Instant::now();
+        let expires_at = now + ttl;
+        if let Ok(mut shard) = self.shards[idx].write() {
+            if shard.len() >= MAX_ENTRIES_PER_SHARD {
+                // Prune expired entries first
+                shard.retain(|_, v| v.expires_at > now);
+                // If still full, remove an arbitrary item
+                if shard.len() >= MAX_ENTRIES_PER_SHARD {
+                    if let Some(first_key) = shard.keys().next().cloned() {
+                        shard.remove(&first_key);
+                    }
+                }
+            }
+            shard.insert(key.to_string(), CacheEntry { value, expires_at });
+        }
+    }
+
+    pub fn clear(&self) {
+        for shard in &self.shards {
+            if let Ok(mut s) = shard.write() {
+                s.clear();
+            }
+        }
+    }
+}
+
+pub static L1_CACHE: Lazy<ShardedL1Cache> = Lazy::new(ShardedL1Cache::new);
+
+// ══════════════════════════════════════════════════════════════════
+// UPSTREAM CLIENT IDENTITIES & TUNING
+// ══════════════════════════════════════════════════════════════════
 struct ClientIdentity {
     user_agent: &'static str,
     sec_ch_ua: &'static str,
@@ -19,7 +102,7 @@ struct ClientIdentity {
     sec_ch_ua_platform: &'static str,
 }
 
-// 1. Client Identity List (User Agents + Client Hints)
+// Client Identity List (User Agents + Client Hints)
 static CLIENT_IDENTITIES: &[ClientIdentity] = &[
     ClientIdentity {
         user_agent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36",
@@ -59,13 +142,17 @@ static CLIENT_IDENTITIES: &[ClientIdentity] = &[
     },
 ];
 
-// Client Instance — tuned for connection reuse and upstream compression
+// Upstream HTTP Client — tuned for ultra-high concurrency, keepalive and connection pooling
 static CLIENT: Lazy<Client> = Lazy::new(|| {
     Client::builder()
+        .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(10))
-        .pool_max_idle_per_host(10)
+        .pool_max_idle_per_host(200)
         .pool_idle_timeout(Duration::from_secs(90))
         .tcp_nodelay(true)
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .http2_adaptive_window(true)
+        .http2_keep_alive_interval(Some(Duration::from_secs(30)))
         .gzip(true)
         .brotli(true)
         .build()
@@ -108,24 +195,15 @@ fn is_search_endpoint(endpoint: &str) -> bool {
     )
 }
 
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
 static CONSECUTIVE_ERRORS: AtomicUsize = AtomicUsize::new(0);
 static CIRCUIT_OPEN_UNTIL: AtomicU64 = AtomicU64::new(0);
 
 // Request coalescing: deduplicate in-flight requests for same cache key.
-// Each entry holds a OnceCell that is initialized exactly once via
-// `get_or_try_init`, so all waiters share a single upstream fetch.
-// Errors are NOT stored — only successful Values are cached in the cell.
 type FlightCache = Mutex<HashMap<String, Arc<OnceCell<Value>>>>;
-
 static FLIGHT_CACHE: Lazy<FlightCache> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 /// Build a **normalized, deterministic** cache key from the endpoint and
-/// user-supplied params. Params are sorted alphabetically (via BTreeMap),
-/// and for search endpoints the `q` / `query` values are lowercased so
-/// that case-insensitive duplicates hit the same key.
+/// user-supplied params.
 fn build_cache_key(endpoint: &str, params: &HashMap<String, String>) -> String {
     let mut sorted: BTreeMap<&str, String> = BTreeMap::new();
     let normalize_query = is_search_endpoint(endpoint);
@@ -206,7 +284,47 @@ pub async fn use_fetch(
         return Err("HqAudio API is currently unreachable. Circuit breaker is OPEN.".to_string());
     }
 
-    // 2. Build the upstream URL (uses original param values, not normalized)
+    // 2. Build a NORMALIZED cache key
+    let cache_key = build_cache_key(endpoint, &params);
+    let ttl = get_ttl(endpoint);
+
+    // 3. Check L1 Memory Cache (Fastest: < 1 microsecond, 0 network I/O)
+    if ttl > Duration::ZERO {
+        if let Some(cached_val) = L1_CACHE.get(&cache_key) {
+            let _ = crate::LOG_CHANNEL.send(format!("[L1 CACHE HIT] {}", format_cache_key_for_log(&cache_key)));
+            return Ok(cached_val);
+        }
+    }
+
+    // 4. Check L2 Redis Cache (Fast: < 2ms)
+    if ttl > Duration::ZERO {
+        if let Some(pool) = REDIS_POOL.get() {
+            if let Ok(Ok(mut conn)) = tokio::time::timeout(REDIS_CONN_TIMEOUT, pool.get()).await {
+                let cached_data: Result<String, _> = conn.get(&cache_key).await;
+                if let Ok(data_str) = cached_data {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(&data_str) {
+                        // Populate L1 cache for subsequent requests
+                        L1_CACHE.set(&cache_key, parsed.clone(), ttl);
+                        let _ = crate::LOG_CHANNEL.send(format!("[L2 CACHE HIT] {}", format_cache_key_for_log(&cache_key)));
+                        return Ok(parsed);
+                    }
+                }
+            }
+        }
+    }
+
+    let _ = crate::LOG_CHANNEL.send(format!("[CACHE MISS] {}", format_cache_key_for_log(&cache_key)));
+
+    // 5. Request Coalescing (In-flight deduplication)
+    let flight_cell = {
+        let mut flight_cache = FLIGHT_CACHE.lock().await;
+        flight_cache
+            .entry(cache_key.clone())
+            .or_insert_with(|| Arc::new(OnceCell::new()))
+            .clone()
+    };
+
+    // 6. Build the upstream URL
     let mut url = url::Url::parse("https://www.jiosaavn.com/api.php").unwrap();
     {
         let mut query = url.query_pairs_mut();
@@ -221,39 +339,6 @@ pub async fn use_fetch(
         }
     }
 
-    // 3. Build a NORMALIZED cache key — sorted params, search queries lowercased
-    let cache_key = build_cache_key(endpoint, &params);
-    let ttl = get_ttl(endpoint);
-
-    // 4. Try cache lookup (with Redis connection timeout guard)
-    if ttl > Duration::ZERO {
-        if let Some(pool) = REDIS_POOL.get() {
-            if let Ok(Ok(mut conn)) = tokio::time::timeout(REDIS_CONN_TIMEOUT, pool.get()).await {
-                let cached_data: Result<String, _> = conn.get(&cache_key).await;
-                if let Ok(data_str) = cached_data {
-                    if let Ok(parsed) = serde_json::from_str(&data_str) {
-                        let _ = crate::LOG_CHANNEL.send(format!("[CACHE HIT] {}", format_cache_key_for_log(&cache_key)));
-                        return Ok(parsed);
-                    }
-                }
-            }
-        }
-    }
-
-    let _ = crate::LOG_CHANNEL.send(format!("[CACHE MISS] {}", format_cache_key_for_log(&cache_key)));
-
-    // 5. Request coalescing — grab or create a flight cell, then use
-    //    get_or_try_init so only the FIRST caller performs the upstream
-    //    fetch while all others await the same future.
-    let flight_cell = {
-        let mut flight_cache = FLIGHT_CACHE.lock().await;
-        flight_cache
-            .entry(cache_key.clone())
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone()
-    };
-
-    // Capture the URL string for the closure (params already encoded above)
     let url_str = url.to_string();
     let cache_key_for_init = cache_key.clone();
 
@@ -261,7 +346,7 @@ pub async fn use_fetch(
         .get_or_try_init(|| async {
             let fetch_start = Instant::now();
 
-            // Random Client Identity
+            // Select random Client Identity
             let identity = CLIENT_IDENTITIES
                 .choose(&mut rand::thread_rng())
                 .unwrap_or(&CLIENT_IDENTITIES[0]);
@@ -324,8 +409,11 @@ pub async fn use_fetch(
 
     let data = result.clone();
 
-    // 6. Background Redis write — don't block the response on cache storage
+    // 7. Store in L1 Cache immediately
     if ttl > Duration::ZERO {
+        L1_CACHE.set(&cache_key, data.clone(), ttl);
+
+        // 8. Background L2 Redis write — asynchronous and non-blocking
         let cache_key_bg = cache_key.clone();
         let data_bg = data.clone();
         tokio::spawn(async move {
@@ -339,7 +427,7 @@ pub async fn use_fetch(
         });
     }
 
-    // Remove from flight cache after a short delay to allow late waiters
+    // Clean up flight cache after short window
     let cache_key_cleanup = cache_key.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;

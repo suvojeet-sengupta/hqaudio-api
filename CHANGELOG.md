@@ -1,6 +1,15 @@
 # Changelog
 
 
+## v0.1.2
+
+### 🚀 Enhancements
+- Implement high-speed sharded L1 memory cache alongside L2 Redis for sub-microsecond response times and high throughput.
+- Tune upstream HTTP client with connection pooling, keepalive, and circuit breaking.
+- Optimize MemoryBanManager and middleware to eliminate lock contention and Redis overhead on hot request paths.
+- Add safe log tail streaming to handle multi-hundred-megabyte log files with bounded memory.
+- Upgrade real-time Log Viewing UI with stream pause/resume controls, auto-scroll toggle, live RPS throughput meter, L1/L2 cache hit telemetry, 60 FPS DOM ring buffer, and click-to-copy/filter actions.
+
 ## v0.1.1
 
 ### 🚀 Enhancements
