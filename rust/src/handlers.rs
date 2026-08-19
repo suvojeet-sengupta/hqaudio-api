@@ -841,7 +841,7 @@ pub async fn view_log_file(
 
     // 3. Read file tail safely (async & bounded memory)
     let path = format!("logs/{}", file_name);
-    match read_log_tail(&path, 5000, 4 * 1024 * 1024).await {
+    match read_log_tail(&path, 10000, 10 * 1024 * 1024).await {
         Ok(content) => Ok(Json(ApiResponse {
             success: true,
             data: content,
@@ -921,7 +921,7 @@ async fn handle_ws(socket: WebSocket, file_name: String) {
 
     // 2. Load latest history tail (bounded async read to avoid memory overload)
     let path = format!("logs/{}", target_file);
-    if let Ok(content) = read_log_tail(&path, 2500, 2 * 1024 * 1024).await {
+    if let Ok(content) = read_log_tail(&path, 10000, 10 * 1024 * 1024).await {
         // Send initial dump of logs
         let _ = sender.send(Message::Text(format!("[INITIAL_DUMP]\n{}", content))).await;
     } else {

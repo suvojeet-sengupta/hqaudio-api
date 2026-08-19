@@ -466,40 +466,73 @@ function parseLogLine(line) {
     if (line.includes('[DDOS PROTECT]')) return { type: 'ddos-protect', raw: line };
     if (line.includes('[CIRCUIT BREAKER]')) return { type: 'circuit-breaker', raw: line };
 
-    // Format: [YYYY-MM-DD HH:MM:SS] [IP: xxx] [UA: xxx] METHOD /uri STATUS DURATIONms SIZEB
-    const match = line.match(/^(\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\])\s+(?:\[IP:\s*([^\]]+)\]\s+)?(?:\[UA:\s*([^\]]+)\]\s+)?(\w+)\s+(\S+)\s+(\d{3})\s+(\d+ms)(?:\s+(\d+)B)?$/);
-    if (match) {
+    // Extract Timestamp if present: [YYYY-MM-DD HH:MM:SS]
+    let time = '';
+    let rest = line.trim();
+    const timeMatch = rest.match(/^(\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\])\s*/);
+    if (timeMatch) {
+        time = timeMatch[1];
+        rest = rest.slice(timeMatch[0].length);
+    }
+
+    // Extract IP if present: [IP: xxx]
+    let ip = 'unknown';
+    const ipMatch = rest.match(/^\[IP:\s*([^\]]+)\]\s*/);
+    if (ipMatch) {
+        ip = ipMatch[1].trim();
+        rest = rest.slice(ipMatch[0].length);
+    }
+
+    // Extract User-Agent if present: [UA: xxx]
+    let ua = 'unknown';
+    const uaMatch = rest.match(/^\[UA:\s*(.*?)\]\s+(?=(?:GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s)/i);
+    if (uaMatch) {
+        ua = uaMatch[1].trim();
+        rest = rest.slice(uaMatch[0].length);
+    } else {
+        const simpleUaMatch = rest.match(/^\[UA:\s*([^\]]+)\]\s*/);
+        if (simpleUaMatch) {
+            ua = simpleUaMatch[1].trim();
+            rest = rest.slice(simpleUaMatch[0].length);
+        }
+    }
+
+    // Match HTTP Request: METHOD URI STATUS DURATION [SIZE]
+    const reqMatch = rest.match(/^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)\s+(\d{3})\s+(\d+)ms(?:\s+(\d+)B)?/i);
+    if (reqMatch) {
         return {
             type: 'request',
             raw: line,
-            time: match[1],
-            ip: match[2] || 'unknown',
-            ua: match[3] || 'unknown',
-            method: match[4],
-            uri: match[5],
-            status: parseInt(match[6], 10),
-            statusStr: match[6],
-            duration: match[7],
-            durationMs: parseInt(match[7], 10),
-            sizeBytes: match[8] || '0'
+            time: time || '[Live]',
+            ip: ip,
+            ua: ua,
+            method: reqMatch[1].toUpperCase(),
+            uri: reqMatch[2],
+            status: parseInt(reqMatch[3], 10),
+            statusStr: reqMatch[3],
+            duration: `${reqMatch[4]}ms`,
+            durationMs: parseInt(reqMatch[4], 10),
+            sizeBytes: reqMatch[5] || '0'
         };
     }
 
-    // Fallback loose match
-    const looseMatch = line.match(/^(\[\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\])\s+(\w+)\s+(\S+)\s+(\d{3})\s*(.*)$/);
+    // Loose match fallback for any custom or legacy formatted request
+    const looseMatch = rest.match(/\b(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS)\s+(\S+)\s+(\d{3})(?:\s+(\d+)ms)?/i);
     if (looseMatch) {
-        const durMatch = (looseMatch[5] || '').match(/(\d+)ms/);
+        const durMs = looseMatch[4] ? parseInt(looseMatch[4], 10) : 0;
         return {
             type: 'request',
             raw: line,
-            time: looseMatch[1],
-            method: looseMatch[2],
-            uri: looseMatch[3],
-            status: parseInt(looseMatch[4], 10),
-            statusStr: looseMatch[4],
-            duration: durMatch ? durMatch[0] : '',
-            durationMs: durMatch ? parseInt(durMatch[1], 10) : 0,
-            ip: 'unknown'
+            time: time || '[Live]',
+            ip: ip,
+            ua: ua,
+            method: looseMatch[1].toUpperCase(),
+            uri: looseMatch[2],
+            status: parseInt(looseMatch[3], 10),
+            statusStr: looseMatch[3],
+            duration: durMs ? `${durMs}ms` : '',
+            durationMs: durMs,
+            sizeBytes: '0'
         };
     }
 
